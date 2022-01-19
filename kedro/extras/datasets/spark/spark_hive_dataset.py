@@ -17,7 +17,6 @@ class StagedHiveDataSet:
     Provides a context manager for temporarily writing data to a staging hive table, for example
     where you want to replace the contents of a hive table with data which relies on the data
     currently present in that table.
-
     Once initialised, the ``staged_data`` ``DataFrame`` can be queried and underlying tables used to
     define the initial dataframe can be modified without affecting ``staged_data``.
 
@@ -62,28 +61,25 @@ class SparkHiveDataSet(AbstractDataSet):
     This data set also handles some incompatible file types such as using partitioned parquet on
     hive which will not normally allow upserts to existing data without a complete replacement
     of the existing file/partition.
-
     This DataSet has some key assumptions:
     - Schemas do not change during the pipeline run (defined PKs must be present for the
     duration of the pipeline)
     - Tables are not being externally modified during upserts. The upsert method is NOT ATOMIC
     to external changes to the target table while executing.
-
     Example adding a catalog entry with
     `YAML API <https://kedro.readthedocs.io/en/stable/05_data/\
         01_data_catalog.html#using-the-data-catalog-with-the-yaml-api>`_:
-
     .. code-block:: yaml
-
         >>> hive_dataset:
         >>>   type: spark.SparkHiveDataSet
         >>>   database: hive_database
         >>>   table: table_name
         >>>   write_mode: overwrite
-
+        >>>   table_type: internal
+        >>>   table_path: None
+        >>>   table_format: None
     Example using Python API:
     ::
-
         >>> from pyspark.sql import SparkSession
         >>> from pyspark.sql.types import (StructField, StringType,
         >>>                                IntegerType, StructType)
@@ -106,17 +102,25 @@ class SparkHiveDataSet(AbstractDataSet):
     """
 
     def __init__(
-        self, database: str, table: str, write_mode: str, table_pk: List[str] = None
+        self,
+        database: str,
+        table: str,
+        write_mode: str,
+        table_pk: List[str] = None,
+        table_format: str = "Parquet",
+        table_type: str = "INTERNAL",
+        table_path: str = None,
     ) -> None:
         """Creates a new instance of ``SparkHiveDataSet``.
-
         Args:
             database: The name of the hive database.
             table: The name of the table within the database.
             write_mode: ``insert``, ``upsert`` or ``overwrite`` are supported.
             table_pk: If performing an upsert, this identifies the primary key columns used to
                 resolve preexisting data. Is required for ``write_mode="upsert"``.
-
+            table_format: A valid table format accepted by hive for eg Parquet
+            table_type: ``internal``,``external``
+            table_path: In case selected table is external,we need an external path for the table
         Raises:
             DataSetError: Invalid configuration supplied
         """
@@ -130,11 +134,36 @@ class SparkHiveDataSet(AbstractDataSet):
         if write_mode == "upsert" and not table_pk:
             raise DataSetError("`table_pk` must be set to utilise `upsert` read mode")
 
+        valid_table_type = ["internal", "external", None, "INTERNAL", "EXTERNAL"]
+        if table_type not in valid_table_type:
+            valid_table_modes = ", ".join(valid_table_type)
+            raise DataSetError(
+                f"Invalid `table_type` provided: {table_type}. "
+                f"`table_type` must be one of: {valid_table_modes}"
+            )
+
+        if table_type in ["internal", "INTERNAL", None]:
+            print("Hive table created will be of Internal type")
+
+        if table_type in ["external", "EXTERNAL"] and table_path is None:
+            raise DataSetError(print("No path specified for External table type"))
+
+        valid_table_formats = ["TextFile", "SequenceFile", "ORC", "Parquet"]
+
+        if table_format not in valid_table_formats:
+            valid_table_format_modes = ", ".join(valid_table_formats)
+            raise DataSetError(
+                f"`table_format` must be one of: {valid_table_format_modes} types"
+            )
+
         self._write_mode = write_mode
         self._table_pk = table_pk or []
         self._database = database
         self._table = table
         self._stage_table = "_temp_" + table
+        self._table_type = table_type
+        self._table_path = table_path
+        self._table_format = table_format
 
         # self._table_columns is set up in _save() to speed up initialization
         self._table_columns = []  # type: List[str]
@@ -145,6 +174,9 @@ class SparkHiveDataSet(AbstractDataSet):
             table=self._table,
             write_mode=self._write_mode,
             table_pk=self._table_pk,
+            table_type=self._table_type,
+            table_path=self._table_path,
+            table_format=self._table_format,
         )
 
     @staticmethod
@@ -152,10 +184,21 @@ class SparkHiveDataSet(AbstractDataSet):
         return SparkSession.builder.getOrCreate()
 
     def _create_empty_hive_table(self, data):
-        data.createOrReplaceTempView("tmp")
-        self._get_spark().sql(
-            f"create table {self._database}.{self._table} select * from tmp limit 1"  # nosec
-        )
+        # if self._table_type and self._table_type.lower() == 'internal'
+        # do external
+        # fx createinternaltable
+        if self._table_type in ["INTERNAL", "internal", None]:
+            data.createOrReplaceTempView("tmp")
+            self._get_spark().sql(
+                f"create table {self._database}.{self._table} STORED AS {self._table_format} as select * from tmp limit 1;"
+                # nosec
+            )
+
+        elif self._table_type in ["EXTERNAL", "external"]:
+            data.write.format(self._table_format).options(
+                map("path", self._table_path)
+            ).saveAsTable(f"`{self._database}.{self._table}`")
+
         self._get_spark().sql(f"truncate table {self._database}.{self._table}")  # nosec
 
     def _load(self) -> DataFrame:
